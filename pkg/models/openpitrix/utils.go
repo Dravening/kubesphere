@@ -24,6 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/klog"
+
 	"github.com/Masterminds/semver/v3"
 	"github.com/go-openapi/strfmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,11 +34,20 @@ import (
 
 	"kubesphere.io/kubesphere/pkg/apis/application/v1alpha1"
 	"kubesphere.io/kubesphere/pkg/constants"
+	"kubesphere.io/kubesphere/pkg/models"
 	"kubesphere.io/kubesphere/pkg/server/params"
 	"kubesphere.io/kubesphere/pkg/simple/client/openpitrix/helmrepoindex"
 	"kubesphere.io/kubesphere/pkg/utils/idutils"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"kubesphere.io/kubesphere/pkg/utils/stringutils"
+)
+
+const (
+	ChartMuseumOwner     = "chart-museum"
+	ChartMuseumWorkspace = "chart-museum-workspace"
+
+	doCustomAppVersionActionMessage  = "chart-museum-message"
+	doCustomAppVersionActionUsername = "chart-museum"
 )
 
 func convertRepoEvent(meta *metav1.ObjectMeta, state *v1alpha1.HelmRepoSyncState) *RepoEvent {
@@ -345,6 +356,111 @@ func convertApp(app *v1alpha1.HelmApplication, versions []*v1alpha1.HelmApplicat
 	return out
 }
 
+func convertChartMuseumCharts2Apps(charts models.ChartMuseumCharts, conditions *params.Conditions, orderBy string, reverse bool, limit, offset int, m map[string]string) []*CustomApp {
+	if charts == nil {
+		return nil
+	}
+
+	klog.Errorf("charts: %+v conditions: %+v m: %+v", charts, conditions, m)
+
+	apps := make([]*CustomApp, 0, len(charts))
+
+	for _, chart := range charts {
+		if len(chart) > 0 {
+			c := chart[0]
+			if !filterChartMuseumChartsApps(c, conditions) {
+				continue
+			}
+
+			date := strfmt.DateTime(c.Created)
+
+			appId := ""
+			digest := c.Digest
+			if len(digest) > 63 {
+				digest = digest[:63]
+			}
+			if v, ok := m[digest]; ok {
+				appId = v
+			}
+
+			latestAppVersion := &AppVersion{
+				CreateTime:  &date,
+				Description: c.Description,
+				Name:        fmt.Sprintf("%s[%s]", c.Version, strings.TrimLeft(c.AppVersion, "v")),
+				Owner:       ChartMuseumOwner,
+				StatusTime:  &date,
+				UpdateTime:  &date,
+				VersionId:   c.Digest,
+			}
+			if len(c.URLs) > 0 {
+				latestAppVersion.PackageName = strings.TrimLeft(c.URLs[0], "charts/")
+			}
+			if appId != "" {
+				latestAppVersion.AppId = appId
+			}
+
+			versions := make([]*CustomAppVersion, 0, len(chart))
+			for _, cht := range chart {
+				dt := strfmt.DateTime(c.Created)
+				version := &CustomAppVersion{
+					Digest: cht.Digest,
+				}
+				version.CreateTime = &dt
+				version.Description = cht.Description
+				version.Icon = cht.Icon
+				version.Name = fmt.Sprintf("%s[%s]", cht.Version, strings.TrimLeft(cht.AppVersion, "v"))
+				version.Owner = ChartMuseumOwner
+				version.StatusTime = &dt
+				version.UpdateTime = &dt
+				appid := ""
+				digest := cht.Digest
+				if len(digest) > 63 {
+					digest = digest[:63]
+				}
+				if v, ok := m[digest]; ok {
+					appid = v
+				}
+				if appid != "" {
+					version.AppId = appid
+				}
+
+				versions = append(versions, version)
+			}
+
+			app := &CustomApp{}
+			app.CreateTime = &date
+			app.Description = c.Description
+			app.Icon = c.Icon
+			app.LatestAppVersion = latestAppVersion
+			app.Name = c.Name
+			app.Owner = ChartMuseumOwner
+			app.StatusTime = &date
+			app.UpdateTime = &date
+			app.Versions = versions
+
+			apps = append(apps, app)
+		}
+	}
+
+	return apps
+}
+
+func filterChartMuseumChartsApps(chart *models.ChartMuseumChart, conditions *params.Conditions) bool {
+	if conditions != nil && conditions.Match != nil {
+		if namePart := conditions.Match[Keyword]; namePart != "" {
+			if !filterChartMuseumChartsAppByName(chart.Name, namePart) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func filterChartMuseumChartsAppByName(name, namePart string) bool {
+	return strings.Contains(strings.ToLower(name), strings.ToLower(namePart))
+}
+
 func filterAppVersionByState(versions []*v1alpha1.HelmApplicationVersion, states []string) []*v1alpha1.HelmApplicationVersion {
 	if len(states) == 0 {
 		return versions
@@ -580,6 +696,68 @@ func buildApplicationVersion(app *v1alpha1.HelmApplication, chrt helmrepoindex.V
 	return ver
 }
 
+func buildCustomApplicationVersion(app *v1alpha1.HelmApplication, chrt helmrepoindex.VersionInterface, chartPackage *string, creator string) *v1alpha1.HelmApplicationVersion {
+	// create helm application version resource
+	t := metav1.Now()
+	ver := &v1alpha1.HelmApplicationVersion{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				constants.CreatorAnnotationKey: creator,
+			},
+			Name: idutils.GetUuid36(v1alpha1.HelmApplicationVersionIdPrefix),
+			Labels: map[string]string{
+				constants.ChartApplicationIdLabelKey: app.GetHelmApplicationId(),
+				constants.WorkspaceLabelKey:          app.GetWorkspace(),
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					UID:        app.GetUID(),
+					APIVersion: v1alpha1.SchemeGroupVersion.String(),
+					Kind:       "HelmApplication",
+					Name:       app.Name,
+				},
+			},
+		},
+		Spec: v1alpha1.HelmApplicationVersionSpec{
+			Metadata: &v1alpha1.Metadata{
+				Version:     chrt.GetVersion(),
+				AppVersion:  chrt.GetAppVersion(),
+				Name:        chrt.GetName(),
+				Icon:        chrt.GetIcon(),
+				Home:        chrt.GetHome(),
+				Description: stringutils.ShortenString(chrt.GetDescription(), v1alpha1.MsgLen),
+			},
+			Created: &t,
+			// set data to nil before save app version to etcd
+			Data: []byte(*chartPackage),
+		},
+		Status: v1alpha1.HelmApplicationVersionStatus{
+			State: v1alpha1.StateDraft, // todo: 省略审核，直接激活
+			Audit: []v1alpha1.Audit{
+				{
+					State:    v1alpha1.StateDraft, // todo: 省略审核，直接激活
+					Time:     t,
+					Operator: creator,
+				},
+			},
+		},
+	}
+
+	return ver
+}
+
+func filterAppBySpecCategory(app *v1alpha1.HelmApplication, categoryId string) bool {
+	if len(categoryId) == 0 {
+		return true
+	}
+
+	category := app.GetCategoryId()
+	if strings.Contains(strings.ToLower(category), strings.ToLower(categoryId)) {
+		return true
+	}
+	return false
+}
+
 func filterAppByName(app *v1alpha1.HelmApplication, namePart string) bool {
 	if len(namePart) == 0 {
 		return true
@@ -590,6 +768,10 @@ func filterAppByName(app *v1alpha1.HelmApplication, namePart string) bool {
 		return true
 	}
 	return false
+}
+
+func filterAppByLabel(app *v1alpha1.HelmApplication, key, value string) bool {
+	return app.Labels[key] == value
 }
 
 func filterAppByStates(app *v1alpha1.HelmApplication, state []string) bool {
@@ -693,6 +875,13 @@ func filterApps(apps []*v1alpha1.HelmApplication, conditions *params.Conditions)
 			}
 		}
 
+		if conditions.Match[constants.WorkspaceLabelKey] != "" {
+			fv := filterAppByLabel(apps[i], constants.WorkspaceLabelKey, ChartMuseumWorkspace)
+			if !fv {
+				continue
+			}
+		}
+
 		if len(appIdMap) > 0 {
 			if _, exists := appIdMap[apps[i].Name]; !exists {
 				continue
@@ -706,6 +895,16 @@ func filterApps(apps []*v1alpha1.HelmApplication, conditions *params.Conditions)
 				continue
 			}
 		}
+
+		if conditions.Match[SpecifiedCategoryId] != "" {
+			fv := filterAppBySpecCategory(apps[i], conditions.Match[SpecifiedCategoryId])
+			if fv {
+				if conditions.Match[CategoryId] == "" || conditions.Match[SpecifiedCategoryId] != conditions.Match[CategoryId] {
+					continue
+				}
+			}
+		}
+
 		if curr != i {
 			apps[curr] = apps[i]
 		}

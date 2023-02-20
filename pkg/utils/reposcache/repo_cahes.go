@@ -134,7 +134,7 @@ func (c *cachedRepos) AddRepo(repo *v1alpha1.HelmRepo) error {
 	return c.addRepo(repo, false)
 }
 
-//Add new Repo to cachedRepos
+// Add new Repo to cachedRepos
 func (c *cachedRepos) addRepo(repo *v1alpha1.HelmRepo, builtin bool) error {
 	if len(repo.Status.Data) == 0 {
 		return nil

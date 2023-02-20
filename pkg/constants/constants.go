@@ -45,6 +45,7 @@ const (
 	UsernameLabelKey                  = "kubesphere.io/username"
 	DevOpsProjectLabelKey             = "kubesphere.io/devopsproject"
 	KubefedManagedLabel               = "kubefed.io/managed"
+	CustomAppDigestLabel              = "custom/digest"
 
 	UserNameHeader = "X-Token-Username"
 

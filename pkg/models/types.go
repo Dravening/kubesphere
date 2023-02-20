@@ -16,9 +16,15 @@ limitations under the License.
 
 package models
 
+import (
+	"helm.sh/helm/v3/pkg/repo"
+)
+
 type PageableResponse struct {
 	Items      []interface{} `json:"items" description:"paging data"`
 	TotalCount int           `json:"total_count" description:"total count"`
+
+	SpecifiedItems []interface{} `json:"specified_items" description:"specified paging data"`
 }
 
 type Workspace struct {
@@ -43,3 +49,9 @@ type PodInfo struct {
 	Pod       string `json:"pod" description:"pod name"`
 	Container string `json:"container" description:"container name"`
 }
+
+type ChartMuseumChart struct {
+	*repo.ChartVersion
+}
+
+type ChartMuseumCharts map[string][]*ChartMuseumChart

@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"kubesphere.io/kubesphere/pkg/apiserver/query"
 
@@ -153,11 +154,18 @@ func (c *applicationOperator) DescribeAppVersion(id string) (*AppVersion, error)
 }
 
 func (c *applicationOperator) ModifyAppVersion(id string, request *ModifyAppVersionRequest) error {
-
+	count := 20
+	interval := 100 * time.Millisecond
 	version, err := c.versionLister.Get(id)
-	if err != nil {
-		klog.Errorf("get app version [%s] failed, error: %s", id, err)
-		return err
+	for count > 0 {
+		if err != nil {
+			klog.Errorf("get app version count: %d [%s] failed, error: %s", count, id, err)
+			count--
+			time.Sleep(interval)
+			version, err = c.versionLister.Get(id)
+		} else {
+			break
+		}
 	}
 
 	versionCopy := version.DeepCopy()
@@ -445,6 +453,55 @@ func (c *applicationOperator) DoAppVersionAction(versionId string, request *Acti
 			data, _ := patch.Data(appCopy)
 			_, err = c.appClient.Patch(context.TODO(), appCopy.Name, patch.Type(), data, metav1.PatchOptions{})
 			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// todo: param: helmapplication, helmapplicationversion
+func (c *applicationOperator) DoCustomAppVersionAction(ver *v1alpha1.HelmApplicationVersion) error {
+
+	// release version
+	{
+		// if we release a new helm application version, we need update the spec in helm application copy
+		app, err := c.appLister.Get(ver.GetHelmApplicationId())
+		if err != nil {
+			klog.Errorf("ver: %+v err: %v", ver, err)
+			return err
+		}
+		appInStore, err := c.appLister.Get(fmt.Sprintf("%s%s", ver.GetHelmApplicationId(), v1alpha1.HelmApplicationAppStoreSuffix))
+		if err != nil {
+			klog.Errorf("ver: %+v err: %v", ver, err)
+			if apierrors.IsNotFound(err) {
+				// controller-manager will create application in app store
+				// todo: 创建-store
+				if !reflect.DeepEqual(&app.Spec, &appInStore.Spec) {
+					appCopy := appInStore.DeepCopy()
+					appCopy.Spec = app.Spec
+					patch := client.MergeFrom(appInStore)
+					data, _ := patch.Data(appCopy)
+					_, err = c.appClient.Patch(context.TODO(), appCopy.Name, patch.Type(), data, metav1.PatchOptions{})
+					if err != nil {
+						klog.Errorf("ver: %+v err: %v", ver, err)
+						return err
+					}
+				}
+				return nil
+			}
+			return err
+		}
+
+		if !reflect.DeepEqual(&app.Spec, &appInStore.Spec) {
+			appCopy := appInStore.DeepCopy()
+			appCopy.Spec = app.Spec
+			patch := client.MergeFrom(appInStore)
+			data, _ := patch.Data(appCopy)
+			_, err = c.appClient.Patch(context.TODO(), appCopy.Name, patch.Type(), data, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("ver: %+v err: %v", ver, err)
 				return err
 			}
 		}

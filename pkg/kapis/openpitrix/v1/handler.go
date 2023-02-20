@@ -24,9 +24,11 @@ import (
 	restful "github.com/emicklei/go-restful"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 
 	"kubesphere.io/kubesphere/pkg/api"
 	"kubesphere.io/kubesphere/pkg/apis/application/v1alpha1"
@@ -35,6 +37,8 @@ import (
 	"kubesphere.io/kubesphere/pkg/constants"
 	"kubesphere.io/kubesphere/pkg/informers"
 	"kubesphere.io/kubesphere/pkg/models/openpitrix"
+	resourcev1alpha2 "kubesphere.io/kubesphere/pkg/models/resources/v1alpha2/resource"
+	resourcev1alpha3 "kubesphere.io/kubesphere/pkg/models/resources/v1alpha3/resource"
 	"kubesphere.io/kubesphere/pkg/server/errors"
 	"kubesphere.io/kubesphere/pkg/server/params"
 	openpitrixoptions "kubesphere.io/kubesphere/pkg/simple/client/openpitrix"
@@ -45,9 +49,12 @@ import (
 
 type openpitrixHandler struct {
 	openpitrix openpitrix.Interface
+
+	resourceGetterV1alpha3  *resourcev1alpha3.ResourceGetter
+	resourcesGetterV1alpha2 *resourcev1alpha2.ResourceGetter
 }
 
-func newOpenpitrixHandler(ksInformers informers.InformerFactory, ksClient versioned.Interface, option *openpitrixoptions.Options) *openpitrixHandler {
+func newOpenpitrixHandler(ksInformers informers.InformerFactory, ksClient versioned.Interface, option *openpitrixoptions.Options, cache cache.Cache) *openpitrixHandler {
 	var s3Client s3.Interface
 	if option != nil && option.S3Options != nil && len(option.S3Options.Endpoint) != 0 {
 		var err error
@@ -56,9 +63,13 @@ func newOpenpitrixHandler(ksInformers informers.InformerFactory, ksClient versio
 			klog.Errorf("failed to connect to storage, please check storage service status, error: %v", err)
 		}
 	}
+	resourceGetterV1alpha3 := resourcev1alpha3.NewResourceGetter(ksInformers, cache)
+	resourcesGetterV1alpha2 := resourcev1alpha2.NewResourceGetter(ksInformers)
 
 	return &openpitrixHandler{
-		openpitrix.NewOpenpitrixOperator(ksInformers, ksClient, s3Client),
+		openpitrix:              openpitrix.NewOpenpitrixOperator(ksInformers, ksClient, s3Client),
+		resourceGetterV1alpha3:  resourceGetterV1alpha3,
+		resourcesGetterV1alpha2: resourcesGetterV1alpha2,
 	}
 }
 
@@ -368,6 +379,81 @@ func (h *openpitrixHandler) CreateApp(req *restful.Request, resp *restful.Respon
 
 	resp.WriteEntity(result)
 }
+
+// todo: 下载远端helm chart至系统
+//  1. 从远程应用仓库下载tgz: 参数包括chart的name和digest
+//     验证参数：GET /api/charts/<name>/<version>
+//  2. 模拟上传tgz，包括验证tgz、创建:
+//     参考本接口CreateCustomApp
+//  3. 模拟提交审核:
+//     PATCH, ModifyAppVersion, "/apps/{app}/versions/{version}"
+//     POST, DoAppVersionAction, "/apps/{app}/versions/{version}/action": 参数{action: "submit"}
+//  4. 模拟审核:
+//     POST, DoAppVersionAction, "/apps/{app}/versions/{version}/action": 参数{action: "pass"}
+//  5. 模拟上传至应用商店:
+//     POST, DoAppVersionAction, "/apps/{app}/versions/{version}/action": 参数{action: "release"}
+func (h *openpitrixHandler) CreateCustomApp(req *restful.Request, resp *restful.Response) {
+	// todo: 参数
+	createCustomApp := &openpitrix.CreateCustomAppRequest{}
+	err := req.ReadEntity(createCustomApp)
+	if err != nil {
+		klog.V(4).Infoln(err)
+		api.HandleBadRequest(resp, nil, err)
+		return
+	}
+
+	// todo: 1
+	//1.1 获取远端仓库地址: 从配置的 configmap 中获取
+	repoUrl, err := h.getCustomAppsConfigmap()
+	if err != nil {
+		klog.V(4).Infoln(err)
+		api.HandleBadRequest(resp, nil, err)
+		return
+	}
+
+	//1.2 验证参数, 并获取对应下载地址：远端仓库中是否有对应helm chart
+	// GET /api/charts/<name>/<version>
+	// resp的urls中包含/charts/mychart-0.1.0.tgz
+	chartMuseumChart, err := h.openpitrix.GetCustomApp(repoUrl, createCustomApp.Name, createCustomApp.Version)
+	if err != nil {
+		if status.Code(err) == codes.InvalidArgument {
+			api.HandleBadRequest(resp, nil, err)
+			return
+		}
+		api.HandleInternalError(resp, nil, err)
+		return
+	}
+
+	// todo: 1.3 下载tgz
+	// GET /charts/mychart-0.1.0.tgz
+	// todo: 前端文件上传格式？？
+	chartAddr := chartMuseumChart.URLs[0]
+	digest := chartMuseumChart.Digest
+	packageBs, err := h.openpitrix.GetCustomChartTgz(repoUrl, chartAddr)
+	if err != nil {
+		klog.Errorln(repoUrl, chartAddr, err)
+		api.HandleInternalError(resp, nil, err)
+		return
+	}
+
+	// todo: 2
+	// todo: 3、4、5
+	// 模拟本接口上传
+	var result interface{}
+	result, err = h.openpitrix.CreateCustomApp(packageBs, digest)
+
+	if err != nil {
+		if status.Code(err) == codes.InvalidArgument {
+			api.HandleBadRequest(resp, nil, err)
+			return
+		}
+		api.HandleInternalError(resp, nil, err)
+		return
+	}
+
+	resp.WriteEntity(result)
+}
+
 func (h *openpitrixHandler) ModifyApp(req *restful.Request, resp *restful.Response) {
 	var patchAppRequest openpitrix.ModifyAppRequest
 	err := req.ReadEntity(&patchAppRequest)
@@ -410,6 +496,72 @@ func (h *openpitrixHandler) ListApps(req *restful.Request, resp *restful.Respons
 
 	if err != nil {
 		klog.Errorln(err)
+		handleOpenpitrixError(resp, err)
+		return
+	}
+
+	resp.WriteEntity(result)
+}
+
+func (h *openpitrixHandler) getCustomAppsConfigmap() (repoUrl string, err error) {
+	var (
+		resourceType = "configmaps"
+		namespace    = "default"
+		name         = "c"
+
+		key = "url"
+	)
+	// use informers to retrieve resources
+	resultV1alpha3, err := h.resourceGetterV1alpha3.Get(resourceType, namespace, name)
+	if err == nil {
+		cm, ok := resultV1alpha3.(*corev1.ConfigMap)
+		if ok && cm.Data != nil {
+			repoUrl = cm.Data[key]
+		} else {
+			klog.Error(err, resourceType, resultV1alpha3, resultV1alpha3)
+		}
+		return
+	} else if err != resourcev1alpha3.ErrResourceNotSupported {
+		klog.Error(err, resourceType, resultV1alpha3)
+		return
+	} else {
+		// fallback to v1alpha2
+		resultV1alpha2, err := h.resourcesGetterV1alpha2.GetResource(namespace, resourceType, name)
+		if err != nil {
+			klog.Error(err, resourceType, resultV1alpha2)
+			if err == resourcev1alpha2.ErrResourceNotSupported {
+				return repoUrl, err
+			}
+			return repoUrl, err
+		}
+	}
+
+	return
+}
+
+func (h *openpitrixHandler) ListCustomApps(req *restful.Request, resp *restful.Response) {
+	repoUrl, err := h.getCustomAppsConfigmap()
+	if err != nil {
+		klog.V(4).Infoln(err)
+		api.HandleBadRequest(resp, nil, err)
+		return
+	}
+
+	limit, offset := params.ParsePaging(req)
+	orderBy := params.GetStringValueWithDefault(req, params.OrderByParam, openpitrix.CreateTime)
+	reverse := params.GetBoolValueWithDefault(req, params.ReverseParam, false)
+	conditions, err := params.ParseConditions(req)
+
+	if err != nil {
+		klog.V(4).Infoln(err)
+		api.HandleBadRequest(resp, nil, err)
+		return
+	}
+
+	result, err := h.openpitrix.ListCustomApps(repoUrl, conditions, orderBy, reverse, limit, offset)
+
+	if err != nil {
+		klog.Errorln(err, repoUrl)
 		handleOpenpitrixError(resp, err)
 		return
 	}

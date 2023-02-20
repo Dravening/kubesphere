@@ -26,10 +26,11 @@ import (
 )
 
 const (
-	PagingParam     = "paging"
-	OrderByParam    = "orderBy"
-	ConditionsParam = "conditions"
-	ReverseParam    = "reverse"
+	PagingParam         = "paging"
+	OrderByParam        = "orderBy"
+	ConditionsParam     = "conditions"
+	ReverseParam        = "reverse"
+	SpecifiedCategoryId = "specified_category_id"
 )
 
 const (

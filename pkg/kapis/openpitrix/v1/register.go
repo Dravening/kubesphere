@@ -19,6 +19,7 @@ import (
 	restful "github.com/emicklei/go-restful"
 	restfulspec "github.com/emicklei/go-restful-openapi"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 
 	"kubesphere.io/kubesphere/pkg/api"
 	"kubesphere.io/kubesphere/pkg/apiserver/runtime"
@@ -38,11 +39,11 @@ const (
 
 var GroupVersion = schema.GroupVersion{Group: GroupName, Version: "v1"}
 
-func AddToContainer(c *restful.Container, ksInfomrers informers.InformerFactory, ksClient versioned.Interface, options *openpitrixoptions.Options) error {
+func AddToContainer(c *restful.Container, ksInfomrers informers.InformerFactory, ksClient versioned.Interface, options *openpitrixoptions.Options, cache cache.Cache) error {
 	mimePatch := []string{restful.MIME_JSON, runtime.MimeJsonPatchJson, runtime.MimeMergePatchJson}
 	webservice := runtime.NewWebService(GroupVersion)
 
-	handler := newOpenpitrixHandler(ksInfomrers, ksClient, options)
+	handler := newOpenpitrixHandler(ksInfomrers, ksClient, options, cache)
 
 	webservice.Route(webservice.POST("/repos").
 		To(handler.CreateRepo).
@@ -238,6 +239,33 @@ func AddToContainer(c *restful.Container, ksInfomrers informers.InformerFactory,
 		Param(webservice.QueryParameter(params.OrderByParam, "sort parameters, e.g. orderBy=createTime")).
 		Metadata(restfulspec.KeyOpenAPITags, []string{constants.OpenpitrixTag}).
 		Returns(http.StatusOK, api.StatusOK, models.PageableResponse{}))
+
+	// custom apps
+	webservice.Route(webservice.GET("/custom/apps").
+		Deprecate().
+		To(handler.ListCustomApps).
+		Doc("List custom app templates").
+		Param(webservice.QueryParameter(params.ConditionsParam, "query conditions,connect multiple conditions with commas, equal symbol for exact query, wave symbol for fuzzy query e.g. name~a").
+			Required(false).
+			DataFormat("key=%s,key~%s")).
+		Param(webservice.QueryParameter(params.PagingParam, "paging query, e.g. limit=100,page=1").
+			Required(false).
+			DataFormat("limit=%d,page=%d").
+			DefaultValue("limit=10,page=1")).
+		Param(webservice.QueryParameter(params.ReverseParam, "sort parameters, e.g. reverse=true")).
+		Param(webservice.QueryParameter(params.OrderByParam, "sort parameters, e.g. orderBy=createTime")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{constants.OpenpitrixTag}).
+		Returns(http.StatusOK, api.StatusOK, models.PageableResponse{}))
+
+	// create custom app
+	webservice.Route(webservice.POST("/custom/apps").
+		Deprecate().
+		To(handler.CreateCustomApp).
+		Doc("Create a new app template from a remote repo").
+		Metadata(restfulspec.KeyOpenAPITags, []string{constants.OpenpitrixTag}).
+		Returns(http.StatusOK, api.StatusOK, openpitrix.CreateAppResponse{}).
+		Reads(openpitrix.CreateCustomAppRequest{}).
+		Param(webservice.PathParameter("app", "app template id")))
 
 	webservice.Route(webservice.GET("/workspaces/{workspace}/apps/{app}").
 		To(handler.DescribeApp).

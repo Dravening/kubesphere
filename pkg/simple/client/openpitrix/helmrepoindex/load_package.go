@@ -95,3 +95,5 @@ func (h HelmVersionWrapper) GetPackageName() string {
 	}
 	return file
 }
+
+func (h HelmVersionWrapper) GetDigest() string { return h.Digest }

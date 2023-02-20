@@ -16,18 +16,21 @@ package openpitrix
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	"kubesphere.io/kubesphere/pkg/apiserver/query"
-
+	"github.com/go-openapi/strfmt"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog"
+	"kubesphere.io/kubesphere/pkg/apiserver/query"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"kubesphere.io/kubesphere/pkg/apis/application/v1alpha1"
@@ -47,6 +50,10 @@ import (
 
 type ApplicationInterface interface {
 	ListApps(conditions *params.Conditions, orderBy string, reverse bool, limit, offset int) (*models.PageableResponse, error)
+	ListCustomApps(repoUrl string, conditions *params.Conditions, orderBy string, reverse bool, limit, offset int) (*models.PageableResponse, error)
+	GetCustomApp(repoUrl, name, version string) (chart *models.ChartMuseumChart, err error)
+	GetCustomChartTgz(repoUrl, chartAddr string) (bs []byte, err error)
+	CreateCustomApp(bs []byte, digest string) (*CreateAppResponse, error)
 	DescribeApp(id string) (*App, error)
 	DeleteApp(id string) error
 	CreateApp(req *CreateAppRequest) (*CreateAppResponse, error)
@@ -110,6 +117,30 @@ func (c *applicationOperator) createApp(app *v1alpha1.HelmApplication, iconData 
 	}
 	if exists != nil {
 		return nil, appItemExists
+	}
+
+	if len(iconData) != 0 {
+		// save icon attachment
+		iconId := idutils.GetUuid(v1alpha1.HelmAttachmentPrefix)
+		err = c.backingStoreClient.Upload(iconId, iconId, bytes.NewBuffer(iconData), len(iconData))
+		if err != nil {
+			klog.Errorf("save icon attachment failed, error: %s", err)
+			return nil, err
+		}
+		app.Spec.Icon = iconId
+	}
+
+	app, err = c.appClient.Create(context.TODO(), app, metav1.CreateOptions{})
+	return app, err
+}
+
+func (c *applicationOperator) _createCustomApp(app *v1alpha1.HelmApplication, iconData []byte) (*v1alpha1.HelmApplication, error) {
+	exists, err := c.getHelmAppByName(app.GetWorkspace(), app.GetTrueName())
+	if err != nil {
+		return nil, err
+	}
+	if exists != nil {
+		return exists, appItemExists
 	}
 
 	if len(iconData) != 0 {
@@ -313,8 +344,8 @@ func (c *applicationOperator) ListApps(conditions *params.Conditions, orderBy st
 	totalCount := len(apps)
 	start, end := (&query.Pagination{Limit: limit, Offset: offset}).GetValidPagination(totalCount)
 	apps = apps[start:end]
-	items := make([]interface{}, 0, len(apps))
 
+	items := make([]interface{}, 0, len(apps))
 	for i := range apps {
 		versions, err := c.getAppVersionsByAppId(apps[i].GetHelmApplicationId())
 		if err != nil && !apierrors.IsNotFound(err) {
@@ -323,7 +354,311 @@ func (c *applicationOperator) ListApps(conditions *params.Conditions, orderBy st
 		ctg, _ := c.ctgLister.Get(apps[i].GetHelmCategoryId())
 		items = append(items, convertApp(apps[i], versions, ctg, 0))
 	}
-	return &models.PageableResponse{Items: items, TotalCount: totalCount}, nil
+
+	specifiedItems := make([]interface{}, 0)
+	if conditions.Match[SpecifiedCategoryId] != "" {
+		conds := &params.Conditions{Match: make(map[string]string, 0), Fuzzy: make(map[string]string, 0)}
+		for k, v := range conditions.Match {
+			conds.Match[k] = v
+		}
+		for k, v := range conditions.Fuzzy {
+			conds.Fuzzy[k] = v
+		}
+		conds.Match[CategoryId] = conditions.Match[SpecifiedCategoryId]
+		specifiedCategoryIdApps, _ := c.specifiedCategoryIdApps(conds)
+
+		for i := range specifiedCategoryIdApps {
+			versions, err := c.getAppVersionsByAppId(specifiedCategoryIdApps[i].GetHelmApplicationId())
+			if err != nil && !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+			ctg, _ := c.ctgLister.Get(specifiedCategoryIdApps[i].GetHelmCategoryId())
+			specifiedItems = append(specifiedItems, convertApp(specifiedCategoryIdApps[i], versions, ctg, 0))
+		}
+	}
+
+	return &models.PageableResponse{Items: items, SpecifiedItems: specifiedItems, TotalCount: totalCount}, nil
+}
+
+func digest2AppIdOfCustomApp(apps []*v1alpha1.HelmApplication) map[string]string {
+	m := make(map[string]string)
+	for i := range apps {
+		digest := apps[i].Labels[constants.CustomAppDigestLabel]
+		if len(digest) > 63 {
+			digest = digest[:63]
+		}
+		appId := apps[i].Name
+		m[digest] = appId
+	}
+
+	return m
+}
+
+func (c *applicationOperator) ListCustomApps(repoUrl string, conditions *params.Conditions, orderBy string, reverse bool, limit, offset int) (*models.PageableResponse, error) {
+	repoUrl = strings.TrimRight(repoUrl, "/") + "/api/charts"
+
+	res, err := http.Get(repoUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	bs, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	charts := models.ChartMuseumCharts{}
+	if err := json.Unmarshal(bs, &charts); err != nil {
+		return nil, err
+	}
+
+	conditions2 := &params.Conditions{Match: make(map[string]string), Fuzzy: make(map[string]string)}
+	for k, v := range conditions.Match {
+		conditions2.Match[k] = v
+	}
+	conditions2.Match[constants.WorkspaceLabelKey] = ChartMuseumWorkspace
+	for k, v := range conditions.Fuzzy {
+		conditions2.Fuzzy[k] = v
+	}
+	helmApps, err := c.listApps(conditions2)
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+	helmApps = filterApps(helmApps, conditions2)
+
+	m := digest2AppIdOfCustomApp(helmApps)
+
+	apps := convertChartMuseumCharts2Apps(charts, conditions2, orderBy, reverse, limit, offset, m)
+
+	if reverse {
+		sort.Sort(sort.Reverse(AppList(apps)))
+	} else {
+		sort.Sort(AppList(apps))
+	}
+
+	totalCount := len(apps)
+	start, end := (&query.Pagination{Limit: limit, Offset: offset}).GetValidPagination(totalCount)
+	apps = apps[start:end]
+
+	items := make([]interface{}, 0, len(apps))
+	for _, app := range apps {
+		items = append(items, app)
+	}
+
+	return &models.PageableResponse{Items: items, TotalCount: len(items)}, nil
+}
+
+// /api/charts/<name>/<version>
+func (c *applicationOperator) GetCustomApp(repoUrl, name, version string) (chart *models.ChartMuseumChart, err error) {
+	repoUrl = fmt.Sprintf("%s/api/charts/%s/%s", strings.TrimRight(repoUrl, "/"), name, version)
+	res, err := http.Get(repoUrl)
+	if err != nil {
+		klog.Errorf("chart[%s] version[%s]: failed to connect [] chart, error: %s", name, version, repoUrl, err)
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	bs, err := io.ReadAll(res.Body)
+	if err != nil {
+		klog.Errorf("chart[%s] version[%s]: failed to read Body from [] chart, error: %s", name, version, repoUrl, err)
+		return nil, err
+	}
+
+	chart = &models.ChartMuseumChart{}
+	if err := json.Unmarshal(bs, &chart); err != nil {
+		klog.Errorf("load custom app package failed, error: %s", err)
+		return nil, err
+	}
+
+	if chart == nil || chart.ChartVersion == nil {
+		klog.Errorf("chart[%s] version[%s]: empty chart, error: %s", name, version, err)
+		return nil, errors.New(fmt.Sprintf("chart[%s] version[%s] not exit", name, version))
+	}
+
+	if len(chart.URLs) == 0 {
+		klog.Errorf("chart[%s] version[%s]: empty chart url, error: %s", name, version, err)
+		return nil, errors.New("chart address not exit")
+	}
+
+	return chart, nil
+}
+
+// /charts/mychart-0.1.0.tgz
+func (c *applicationOperator) GetCustomChartTgz(repoUrl, chartAddr string) (bs []byte, err error) {
+	repoUrl = strings.TrimRight(repoUrl, "/") + "/" + strings.TrimLeft(chartAddr, "/")
+	res, err := http.Get(repoUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	bs, err = io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return bs, nil
+}
+
+func (c *applicationOperator) createCustomApp(req *CreateCustomApp) (*CreateAppResponse, error) {
+	if c.backingStoreClient == nil {
+		return nil, invalidS3Config
+	}
+	chrt, err := helmrepoindex.LoadPackage(req.VersionPackage)
+	if err != nil {
+		klog.Errorf("load package %s/%s failed, error: %s", req.Isv, req.Name, err)
+		return nil, err
+	}
+
+	// create helm application
+	name := idutils.GetUuid36(v1alpha1.HelmApplicationIdPrefix)
+	helmApp := &v1alpha1.HelmApplication{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Annotations: map[string]string{
+				constants.CreatorAnnotationKey: req.Username,
+			},
+			Labels: map[string]string{
+				constants.WorkspaceLabelKey:    req.Isv,
+				constants.CustomAppDigestLabel: req.Digest,
+			},
+		},
+		Spec: v1alpha1.HelmApplicationSpec{
+			Name:        req.Name,
+			Description: stringutils.ShortenString(chrt.GetDescription(), v1alpha1.MsgLen),
+			Icon:        stringutils.ShortenString(chrt.GetIcon(), v1alpha1.MsgLen),
+		},
+	}
+	app, err := c._createCustomApp(helmApp, req.Icon)
+	if err != nil && err != appItemExists {
+		klog.Errorf("create helm application %s/%s failed, error: %s", req.Isv, req.Name, err)
+		if helmApp.Spec.Icon != "" {
+			c.backingStoreClient.Delete(helmApp.Spec.Icon)
+		}
+		return nil, err
+	} else {
+		klog.V(4).Infof("helm application %s/%s created, app id: %s", req.Isv, req.Name, app.Name)
+	}
+
+	// create app version
+	chartPackage := req.VersionPackage.String()
+	ver := buildApplicationVersion(app, chrt, &chartPackage, req.Username)
+	ver, err = c.createApplicationVersion(ver)
+
+	if err != nil {
+		klog.Errorf("create helm application %s/%s versions failed, error: %s", req.Isv, req.Name, err)
+		return nil, err
+	} else {
+		klog.V(4).Infof("helm application version %s/%s created, app version id: %s", req.Isv, req.Name, ver.Name)
+	}
+
+	return &CreateAppResponse{
+		AppID:     app.GetHelmApplicationId(),
+		VersionID: ver.GetHelmApplicationVersionId(),
+	}, nil
+}
+
+func (c *applicationOperator) CreateCustomApp(bs []byte, digest string) (*CreateAppResponse, error) {
+	if c.backingStoreClient == nil {
+		return nil, invalidS3Config
+	}
+	chrt, err := helmrepoindex.LoadPackage(bs)
+	if err != nil {
+		klog.Errorf("load custom app package failed, error: %s", err)
+		return nil, err
+	}
+
+	req := &CreateCustomApp{}
+	req.Icon = []byte(chrt.GetIcon())
+	req.Isv = ChartMuseumWorkspace
+	req.Name = chrt.GetName()
+	req.VersionPackage = strfmt.Base64(bs)
+	req.Username = ChartMuseumOwner
+	if len(digest) > 63 {
+		digest = digest[:63]
+	}
+	req.Digest = digest
+
+	createAppResp, err := c.createCustomApp(req)
+	if err != nil {
+		klog.Errorf("create custom app/appversion failed, error: %s", err)
+		return nil, err
+	}
+
+	modifyAppVersionRequest := &ModifyAppVersionRequest{}
+	modifyAppVersionRequestDescription := chrt.GetDescription()
+	modifyAppVersionRequest.Description = &modifyAppVersionRequestDescription
+	modifyAppVersionRequestName := fmt.Sprintf("%s[%s]", chrt.GetVersion(), strings.TrimLeft(chrt.GetAppVersion(), "v"))
+	modifyAppVersionRequest.Name = &modifyAppVersionRequestName
+	if err := c.ModifyAppVersion(createAppResp.VersionID, modifyAppVersionRequest); err != nil {
+		klog.Errorf("create custom  modify appversion createAppResp: %+v modifyAppVersionRequest: %+v , error: %s", createAppResp, modifyAppVersionRequest, err)
+		return nil, err
+	}
+
+	count := 20
+	interval := 100 * time.Millisecond
+	versionId := createAppResp.VersionID
+	actionReq := &ActionRequest{
+		Action: ActionSubmit,
+	}
+	if err := c.DoAppVersionAction(versionId, actionReq); err != nil {
+		klog.Errorf("create custom  app/appversion action versionId: %v actionReq: %+v , error: %s", versionId, actionReq, err)
+		for count >= 0 {
+			count--
+			time.Sleep(interval)
+			klog.Errorf("create custom  app/appversion action versionId: %v actionReq: %+v , error: %s", versionId, actionReq, err)
+			if err = c.DoAppVersionAction(versionId, actionReq); err == nil {
+				break
+			}
+
+			if count == 10 {
+				return nil, err
+			}
+		}
+	}
+
+	count = 20
+	actionReq.Action = ActionPass
+	if err := c.DoAppVersionAction(versionId, actionReq); err != nil {
+		klog.Errorf("create custom  app/appversion action versionId: %v actionReq: %+v , error: %s", versionId, actionReq, err)
+		for count >= 0 {
+			count--
+			time.Sleep(interval)
+			klog.Errorf("create custom  app/appversion action versionId: %v actionReq: %+v , error: %s", versionId, actionReq, err)
+			if err = c.DoAppVersionAction(versionId, actionReq); err == nil {
+				break
+			}
+
+			if count == 0 {
+				return nil, err
+			}
+		}
+	}
+
+	count = 20
+	actionReq.Action = ActionRelease
+	if err := c.DoAppVersionAction(versionId, actionReq); err != nil {
+		klog.Errorf("create custom  app/appversion action versionId: %v actionReq: %+v , error: %s", versionId, actionReq, err)
+		for count >= 0 {
+			count--
+			time.Sleep(interval)
+			klog.Errorf("create custom  app/appversion action versionId: %v actionReq: %+v , error: %s", versionId, actionReq, err)
+			if err = c.DoAppVersionAction(versionId, actionReq); err == nil {
+				break
+			}
+
+			if count == 0 {
+				return nil, err
+			}
+		}
+	}
+
+	return createAppResp, nil
 }
 
 func (c *applicationOperator) DeleteApp(id string) error {
@@ -614,6 +949,11 @@ func (c *applicationOperator) listApps(conditions *params.Conditions) (ret []*v1
 		ret, err = c.appLister.List(labels.SelectorFromSet(buildLabelSelector(conditions)))
 	}
 
+	return
+}
+
+func (c *applicationOperator) specifiedCategoryIdApps(conds *params.Conditions) (ret []*v1alpha1.HelmApplication, err error) {
+	ret, err = c.appLister.List(labels.SelectorFromSet(buildLabelSelector(conds)))
 	return
 }
 

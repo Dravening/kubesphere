@@ -33,4 +33,5 @@ type VersionInterface interface {
 	GetScreenshots() string
 	GetPackageName() string
 	GetCreateTime() time.Time
+	GetDigest() string
 }

@@ -206,6 +206,38 @@ type App struct {
 
 	ClusterTotal *int `json:"cluster_total,omitempty"`
 }
+
+type CustomAppVersion struct {
+	AppVersion
+	Digest string `json:"digest"`
+}
+
+type CustomApp struct {
+	App
+	Versions []*CustomAppVersion `json:"versions"`
+}
+
+type AppList []*CustomApp
+
+func (l AppList) Len() int      { return len(l) }
+func (l AppList) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
+func (l AppList) Less(i, j int) bool {
+	t1 := l[i]
+	t2 := l[j]
+	if t1.CreateTime.String() > t2.CreateTime.String() {
+		return true
+	} else if t1.CreateTime.String() < t2.CreateTime.String() {
+		return false
+	} else {
+		if t1.UpdateTime.String() > t2.UpdateTime.String() {
+			return true
+		} else if t1.UpdateTime.String() < t2.UpdateTime.String() {
+			return false
+		}
+	}
+	return true
+}
+
 type AppVersionReviewPhase struct {
 
 	// review message
@@ -307,6 +339,26 @@ type CreateAppRequest struct {
 
 type CreateAppResponse struct {
 
+	// app id
+	AppID string `json:"app_id,omitempty"`
+
+	// version id of the app
+	VersionID string `json:"version_id,omitempty"`
+}
+
+type CreateCustomApp struct {
+	CreateAppRequest
+	Digest string
+}
+
+type CreateCustomAppRequest struct {
+	// chart name
+	Name string `json:"name"`
+	// chart version
+	Version string `json:"version"`
+}
+
+type CreateCustomAppResponse struct {
 	// app id
 	AppID string `json:"app_id,omitempty"`
 
@@ -889,26 +941,27 @@ const (
 	CreateTime = "create_time"
 	StatusTime = "status_time"
 
-	VersionId       = "version_id"
-	RepoId          = "repo_id"
-	CategoryId      = "category_id"
-	Status          = "status"
-	Type            = "type"
-	Visibility      = "visibility"
-	AppId           = "app_id"
-	Keyword         = "keyword"
-	ISV             = "isv"
-	WorkspaceLabel  = "workspace"
-	BuiltinRepoId   = "repo-helm"
-	StatusActive    = "active"
-	StatusSuspended = "suspended"
-	ActionRecover   = "recover"
-	ActionSuspend   = "suspend"
-	ActionCancel    = "cancel"
-	ActionPass      = "pass"
-	ActionReject    = "reject"
-	ActionSubmit    = "submit"
-	ActionRelease   = "release"
-	Ascending       = "ascending"
-	ActionIndex     = "index"
+	VersionId           = "version_id"
+	RepoId              = "repo_id"
+	CategoryId          = "category_id"
+	Status              = "status"
+	Type                = "type"
+	Visibility          = "visibility"
+	AppId               = "app_id"
+	Keyword             = "keyword"
+	ISV                 = "isv"
+	WorkspaceLabel      = "workspace"
+	BuiltinRepoId       = "repo-helm"
+	StatusActive        = "active"
+	StatusSuspended     = "suspended"
+	ActionRecover       = "recover"
+	ActionSuspend       = "suspend"
+	ActionCancel        = "cancel"
+	ActionPass          = "pass"
+	ActionReject        = "reject"
+	ActionSubmit        = "submit"
+	ActionRelease       = "release"
+	Ascending           = "ascending"
+	ActionIndex         = "index"
+	SpecifiedCategoryId = "specified_category_id"
 )
